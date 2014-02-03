@@ -5,17 +5,8 @@ import sys.process._
 import compat.Platform.currentTime
 
 case object Stop
-case object Success
+case class Success(nonce: Long)
 case object TryNext
-
-object Types {
-  type GitTree = String
-  type GitParent = String
-  type GitTimestamp = Long
-  type GitDifficulty = String
-}
-
-import Types._
 
 class Hasher {
   val md = java.security.MessageDigest.getInstance("SHA-1")
@@ -23,6 +14,14 @@ class Hasher {
 
   def encode(msg: String): Array[Byte] = md.digest(msg.getBytes)
   def hexdigest(msg: String): String = {
+    (for(c <- md.digest(msg.getBytes)) yield {
+      val i = c.toInt
+      val j = if(i < 0) 0x100 + i else i
+      "%02x".format(j)
+    }).mkString
+  }
+
+  def hexdigest_(msg: String): String = {
     encode(msg)
       .map(_.toInt)
       .map({ i =>
@@ -34,11 +33,11 @@ class Hasher {
   }
 }
 
-class Miner(_tree: GitTree, _parent: GitParent, _timestamp: GitTimestamp, _difficulty: GitDifficulty, seed: Int) extends Actor {
+class Miner(tree: String, parent: String, timestamp: Long, difficulty: String, seed: Int) extends Actor {
   println(s"Miner $seed initialized")
   val hasher = new Hasher
 
-  def body(nonce: Long)(implicit tree: GitTree, parent: GitParent, timestamp: GitTimestamp) =
+  def body(nonce: Long) =
     f"""|tree $tree
         |parent $parent
         |author Devon Stewart <blast@hardchee.se> $timestamp +0000
@@ -46,32 +45,37 @@ class Miner(_tree: GitTree, _parent: GitParent, _timestamp: GitTimestamp, _diffi
         |
         |Mined a Gitcoin!
         |nonce $seed%02x$nonce%06x""".stripMargin
-  def length()(implicit tree: GitTree, parent: GitParent, timestamp: GitTimestamp) = body(0)
+  val length = body(0).length
 
-  def receiveCur(nonce: Long)(implicit tree: GitTree, parent: GitParent, timestamp: GitTimestamp, difficulty: GitDifficulty): Receive = {
+  val each = 100000
+
+  def receiveCur(nonce: Long, second: Long, count: Int): Receive = {
     case TryNext => {
-      if(nonce % 1000 == 0) print(".")
-      val full = s"commit ${length()}\0${body(nonce)}".format(seed, nonce)
-      val sha = hasher.hexdigest(full)
+      val milis = (currentTime - second)
+      println(s"$seed: $milis")
+      print(".")
+      for(_nonce <- nonce until nonce + each) {
+        val full = s"commit $length\0${body(_nonce)}"
+        val sha = hasher.hexdigest(full)
 
-      if(nonce > 10000000) self ! Stop
+        if(_nonce > 100000000) self ! Stop
 
-      if(sha < difficulty) {
-        println("Success!")
-        println(sha)
-        println(nonce)
-        println(full)
-        self ! Success
+        if(sha < difficulty) {
+          println("Success!")
+          println(sha)
+          println(_nonce)
+          println(full)
+          self ! Success(_nonce)
+        }
       }
-      else {
-        context.become(receiveCur(nonce + 1))
-        self ! TryNext
-      }
+      context.become(receiveCur(nonce + each, currentTime, each))
+      self ! TryNext
     }
 
-    case Success => {
-	    val sha1 = (Seq("echo", "-n", body(nonce)) #| "git hash-object -t commit --stdin -w").!!
+    case Success(_nonce) => {
+	    val sha1 = (Seq("echo", "-n", body(_nonce)) #| "git hash-object -t commit --stdin -w").!!
 	    println(s"git reset --hard $sha1".!!)
+      println("git push".!!)
       self ! Stop
     }
 
@@ -80,16 +84,16 @@ class Miner(_tree: GitTree, _parent: GitParent, _timestamp: GitTimestamp, _diffi
     }
   }
 
-  val receive = receiveCur(0)(_tree, _parent, _timestamp, _difficulty)
+  val receive = receiveCur(0, currentTime, 0)
 }
 
 class Master extends Actor {
   Prototype.roundtrip
-  val _tree = ("git write-tree".!!).trim
-  val _parent = ("git rev-parse HEAD".!!).trim
-  val _difficulty = io.Source.fromFile(new java.io.File("difficulty.txt")).mkString.split("\n")(0) // TODO: This sucks
+  val tree = ("git write-tree".!!).trim
+  val parent = ("git rev-parse HEAD".!!).trim
+  val difficulty = io.Source.fromFile(new java.io.File("difficulty.txt")).mkString.split("\n")(0) // TODO: This sucks
 
-  val miners = for(i <- 0 until 10) yield context.actorOf(Props(new Miner()(_tree, _parent, currentTime, _difficulty, i)))
+  val miners = for(i <- 0 until 7) yield context.actorOf(Props(new Miner(tree, parent, currentTime, difficulty, i)))
 
   def receive: Receive = {
     case Stop => {println("Stopping"); context.stop(self)}
